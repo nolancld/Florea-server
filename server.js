@@ -25,6 +25,33 @@ const db = admin.firestore();
 // ── ROUTES ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: '🌿 Florea server running' }));
 
+// Route secrète de test — envoie une notif immédiate à tous les abonnés
+app.post('/test-notif', async (req, res) => {
+  const subsSnap = await db.collection('subscriptions').get();
+  if (subsSnap.empty) return res.json({ ok: false, msg: 'Aucun abonné' });
+
+  const subs = subsSnap.docs.map(d => ({ id: d.id, sub: d.data().subscription }));
+  const payload = JSON.stringify({
+    title: 'Florea 🌿 — Test',
+    body: '🔔 Ceci est une notification de test !',
+    tag: 'florea-test-' + Date.now(),
+  });
+
+  let sent = 0, failed = 0;
+  for (const { id, sub } of subs) {
+    try {
+      await webpush.sendNotification(sub, payload);
+      sent++;
+    } catch (err) {
+      failed++;
+      if (err.statusCode === 410 || err.statusCode === 404) {
+        await db.collection('subscriptions').doc(id).delete();
+      }
+    }
+  }
+  res.json({ ok: true, sent, failed, total: subs.length });
+});
+
 // Enregistrer un appareil
 app.post('/subscribe', async (req, res) => {
   const { subscription } = req.body;
