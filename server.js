@@ -103,12 +103,15 @@ app.post('/test-notif', async (req, res) => {
 async function checkAndNotify() {
   console.log('Checking all gardens...', new Date().toISOString());
   const now = Date.now();
+  const nowDate = new Date(now);
 
-  // Récupérer tous les jardins
+  // Envoyer les rappels quotidiens seulement à 9h (±30min)
+  const hour = nowDate.getUTCHours() + 1; // UTC+1 Paris (adapter si besoin)
+  const isReminderHour = hour >= 8 && hour <= 10; // fenêtre 8h-10h heure Paris
+
   const gardensSnap = await db.collection('gardens').get();
   if (gardensSnap.empty) { console.log('No gardens'); return; }
 
-  // Récupérer toutes les subscriptions groupées par gardenId
   const subsSnap = await db.collection('subscriptions').get();
   const subsByGarden = {};
   subsSnap.docs.forEach(d => {
@@ -118,7 +121,6 @@ async function checkAndNotify() {
     subsByGarden[gardenId].push({ docId: d.id, sub: subscription });
   });
 
-  // Pour chaque jardin qui a des abonnés, vérifier les plantes
   for (const gardenDoc of gardensSnap.docs) {
     const gardenId = gardenDoc.id;
     const subs = subsByGarden[gardenId];
@@ -126,6 +128,9 @@ async function checkAndNotify() {
 
     const plantsSnap = await db.collection('gardens').doc(gardenId).collection('plants').get();
     if (plantsSnap.empty) continue;
+
+    // Regrouper les plantes en retard pour un seul message groupé
+    const overduePlants = [];
 
     for (const plantDoc of plantsSnap.docs) {
       const p = plantDoc.data();
@@ -137,33 +142,55 @@ async function checkAndNotify() {
 
       const nextWater = last + p.frequency * 86400000;
       const hoursLeft = (nextWater - now) / 3600000;
+      const daysLate = Math.floor(-hoursLeft / 24);
 
       let payload = null;
 
+      // Notif préventive : dans ~1h
       if (hoursLeft >= 0.5 && hoursLeft <= 1.5) {
         payload = JSON.stringify({
           title: 'Florea 🌿',
           body: `${p.emoji} ${p.name} aura besoin d'eau dans 1 heure !`,
           tag: `plant-soon-${plantDoc.id}`,
         });
+        await sendToSubs(subs, payload);
+
+      // Notif immédiate : c'est l'heure
       } else if (hoursLeft >= -1 && hoursLeft < 0.5) {
         payload = JSON.stringify({
           title: 'Florea 🌿 — À arroser !',
           body: `${p.emoji} ${p.name} a besoin d'eau maintenant !`,
           tag: `plant-now-${plantDoc.id}`,
         });
-      } else if (hoursLeft >= -6 && hoursLeft < -1) {
+        await sendToSubs(subs, payload);
+
+      // En retard — ajouter à la liste des rappels quotidiens
+      } else if (hoursLeft < -1) {
+        overduePlants.push({ p, daysLate });
+      }
+    }
+
+    // Envoyer un rappel groupé quotidien à l'heure définie
+    if (isReminderHour && overduePlants.length > 0) {
+      let payload;
+      if (overduePlants.length === 1) {
+        const { p, daysLate } = overduePlants[0];
+        const late = daysLate <= 0 ? "aujourd'hui" : `depuis ${daysLate} jour${daysLate>1?'s':''}`;
         payload = JSON.stringify({
-          title: 'Florea 🌿 — Urgent !',
-          body: `${p.emoji} ${p.name} attend d'être arrosé !`,
-          tag: `plant-late-${plantDoc.id}`,
+          title: 'Florea 🌿 — Rappel arrosage',
+          body: `${p.emoji} ${p.name} doit être arrosé ${late} !`,
+          tag: `daily-reminder-${gardenId}`,
+        });
+      } else {
+        const names = overduePlants.map(({p}) => `${p.emoji} ${p.name}`).join(', ');
+        payload = JSON.stringify({
+          title: `Florea 🌿 — ${overduePlants.length} plantes à arroser`,
+          body: names,
+          tag: `daily-reminder-${gardenId}`,
         });
       }
-
-      if (payload) {
-        console.log(`Sending notif for ${p.name} (garden ${gardenId.slice(0,8)}...)`);
-        await sendToSubs(subs, payload);
-      }
+      await sendToSubs(subs, payload);
+      console.log(`Daily reminder sent for ${overduePlants.length} overdue plant(s) in garden ${gardenId.slice(0,8)}...`);
     }
   }
 }
